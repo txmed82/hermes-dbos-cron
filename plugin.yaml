@@ -1,0 +1,7 @@
+name: hermes-dbos-cron
+version: "0.1.0"
+description: DBOS-backed cron scheduler provider — durable, Postgres-journaled triggers for Hermes cron jobs. jobs.json stays the single source of truth; all native cron UIs keep working.
+author: Colin (Seldinger)
+license: MIT
+requires_env:
+  - DBOS_SYSTEM_DATABASE_URL
