@@ -176,6 +176,35 @@ def _timer_workflow_impl(fire_at_iso: str, context: Dict[str, Any]) -> Dict[str,
     return _fire_workflow_impl(fire_at_iso, context)
 
 
+def _hermes_timezone_name() -> str:
+    """The timezone Hermes itself uses for cron expressions.
+
+    Hermes core computes cron next-run times with ``hermes_time.now()`` in the
+    profile's configured timezone; DBOS cron schedules must clock in that SAME
+    zone or every expression shifts by the UTC offset. Falls back to the
+    server's local zone, then UTC.
+    """
+    try:
+        from hermes_time import get_timezone
+
+        tz = get_timezone()
+        if tz is not None:
+            return str(tz)
+    except Exception:
+        pass
+    try:
+        from datetime import datetime as _dt
+
+        local = _dt.now().astimezone().tzinfo
+        # tzname like 'CDT' is not a valid IANA zone; only trust ZoneInfo keys.
+        key = getattr(local, "key", None)
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return "UTC"
+
+
 class DBOSCronScheduler(CronScheduler):
     """DBOS-backed external cron trigger provider."""
 
@@ -427,7 +456,11 @@ class DBOSCronScheduler(CronScheduler):
         job_id = str(job["id"])
         schedule = job.get("schedule") or {}
         expr = str(schedule.get("expr"))
-        tz = str(job.get("timezone") or schedule.get("timezone") or "UTC")
+        tz = str(
+            job.get("timezone")
+            or schedule.get("timezone")
+            or _hermes_timezone_name()
+        )
         name = self._schedule_name(job_id)
         context = {"profile": self._profile, "job_id": job_id}
         prior = existing.get(name)
