@@ -288,7 +288,10 @@ class DBOSCronScheduler(CronScheduler):
                 config={
                     "name": self._app_name,
                     "system_database_url": _database_url(),
-                    "application_version": PLUGIN_VERSION,
+                    # DBOS requires application_version to be UNIQUE across
+                    # applications sharing one system database. Scope it by
+                    # app name so many profiles can share one Postgres.
+                    "application_version": f"{PLUGIN_VERSION}+{self._app_name}",
                 }
             )
             # Register workflows BEFORE launch (once per process; DBOS keeps
@@ -329,6 +332,7 @@ class DBOSCronScheduler(CronScheduler):
                 recovered,
             )
         self._ensure_launched()
+        self._recover_stale_version_timers()
         try:
             self.reconcile()
         except Exception as exc:
@@ -354,6 +358,66 @@ class DBOSCronScheduler(CronScheduler):
                 logger.warning("DBOS cron periodic reconcile failed: %s", exc)
                 self._record_error(f"{type(exc).__name__}: {exc}")
         self.stop()
+
+    def _recover_stale_version_timers(self) -> None:
+        """Cancel our own PENDING timer workflows from older plugin versions.
+
+        DBOS recovers pending workflows only for its current application
+        version; a version bump would otherwise strand old durable sleeps as
+        PENDING forever. jobs.json remains the desired state, so cancelling is
+        safe: reconcile re-arms every still-desired timer under the current
+        version, and the Hermes misfire backstop covers anything overdue.
+        """
+        from dbos import DBOS
+
+        current = f"{PLUGIN_VERSION}+{self._app_name}"
+        list_workflows = getattr(DBOS, "list_workflows", None)
+        if list_workflows is None:
+            return
+        try:
+            stale = list_workflows(
+                name="hermes_cron_timer",
+                status="PENDING",
+                application_name=self._app_name,
+                load_input=False,
+                load_output=False,
+            )
+        except TypeError:
+            # Older dbos without application_name filter: fall back to prefix.
+            try:
+                stale = [
+                    w
+                    for w in list_workflows(
+                        name="hermes_cron_timer", status="PENDING",
+                        load_input=False, load_output=False,
+                    )
+                    if str(getattr(w, "workflow_id", "")).startswith(
+                        f"hermes-timer:{self._profile}:"
+                    )
+                ]
+            except Exception as exc:
+                logger.debug("stale timer listing failed: %s", exc)
+                return
+        except Exception as exc:
+            logger.debug("stale timer listing failed: %s", exc)
+            return
+        cancelled = 0
+        for wf in stale:
+            if getattr(wf, "app_version", current) == current:
+                continue
+            wf_id = str(getattr(wf, "workflow_id", "") or "")
+            if not wf_id.startswith(f"hermes-timer:{self._profile}:"):
+                continue
+            try:
+                DBOS.cancel_workflow(wf_id)
+                cancelled += 1
+            except Exception as exc:
+                logger.debug("stale timer cancel failed %s: %s", wf_id, exc)
+        if cancelled:
+            logger.info(
+                "Cancelled %d stale-version timer workflow(s); reconcile re-arms",
+                cancelled,
+            )
 
     def stop(self) -> None:
         global _ACTIVE
