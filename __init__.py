@@ -360,13 +360,14 @@ class DBOSCronScheduler(CronScheduler):
         self.stop()
 
     def _recover_stale_version_timers(self) -> None:
-        """Cancel our own PENDING timer workflows from older plugin versions.
+        """Resume our own PENDING timer workflows from older plugin versions.
 
-        DBOS recovers pending workflows only for its current application
+        DBOS auto-recovers pending workflows only for its current application
         version; a version bump would otherwise strand old durable sleeps as
-        PENDING forever. jobs.json remains the desired state, so cancelling is
-        safe: reconcile re-arms every still-desired timer under the current
-        version, and the Hermes misfire backstop covers anything overdue.
+        PENDING forever. ``resume_workflow`` re-enqueues them under the
+        current executor while preserving IDs and journals. Never cancel:
+        the timer workflow ID is deterministic per (job, fire_at), so a
+        cancelled ID would block re-arming that exact fire.
         """
         from dbos import DBOS
 
@@ -377,7 +378,7 @@ class DBOSCronScheduler(CronScheduler):
         try:
             stale = list_workflows(
                 name="hermes_cron_timer",
-                status="PENDING",
+                status=["PENDING", "CANCELLED"],
                 application_name=self._app_name,
                 load_input=False,
                 load_output=False,
@@ -388,7 +389,7 @@ class DBOSCronScheduler(CronScheduler):
                 stale = [
                     w
                     for w in list_workflows(
-                        name="hermes_cron_timer", status="PENDING",
+                        name="hermes_cron_timer", status=["PENDING", "CANCELLED"],
                         load_input=False, load_output=False,
                     )
                     if str(getattr(w, "workflow_id", "")).startswith(
@@ -401,22 +402,24 @@ class DBOSCronScheduler(CronScheduler):
         except Exception as exc:
             logger.debug("stale timer listing failed: %s", exc)
             return
-        cancelled = 0
+        resumed = 0
         for wf in stale:
-            if getattr(wf, "app_version", current) == current:
-                continue
+            status = str(getattr(wf, "status", ""))
+            version = getattr(wf, "app_version", current)
+            if status == "PENDING" and version == current:
+                continue  # healthy; DBOS recovery owns it
             wf_id = str(getattr(wf, "workflow_id", "") or "")
             if not wf_id.startswith(f"hermes-timer:{self._profile}:"):
                 continue
             try:
-                DBOS.cancel_workflow(wf_id)
-                cancelled += 1
+                DBOS.resume_workflow(wf_id)
+                resumed += 1
             except Exception as exc:
-                logger.debug("stale timer cancel failed %s: %s", wf_id, exc)
-        if cancelled:
+                logger.debug("stale timer resume failed %s: %s", wf_id, exc)
+        if resumed:
             logger.info(
-                "Cancelled %d stale-version timer workflow(s); reconcile re-arms",
-                cancelled,
+                "Resumed %d stale timer workflow(s) under the current version",
+                resumed,
             )
 
     def stop(self) -> None:
@@ -595,6 +598,18 @@ class DBOSCronScheduler(CronScheduler):
         try:
             with SetWorkflowID(workflow_id):
                 DBOS.start_workflow(self._timer_workflow, fire_at, context)
+            # Deterministic IDs can collide with a CANCELLED prior workflow
+            # (start attaches to it and it never runs). Resume in that case.
+            try:
+                get_status = getattr(DBOS, "get_workflow_status", None)
+                if get_status is not None:
+                    status = get_status(workflow_id)
+                    if status is not None and str(
+                        getattr(status, "status", "")
+                    ) == "CANCELLED":
+                        DBOS.resume_workflow(workflow_id)
+            except Exception as exc:
+                logger.debug("timer cancel-heal check failed %s: %s", workflow_id, exc)
             self._known_timers[job_id] = fire_at
         except Exception as exc:
             logger.warning("DBOS cron: failed to arm timer for %s: %s", job_id, exc)
