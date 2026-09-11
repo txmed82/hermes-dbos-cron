@@ -202,6 +202,20 @@ def _hermes_timezone_name() -> str:
             return str(key)
     except Exception:
         pass
+    # POSIX hosts (incl. macOS): /etc/localtime resolves into a zoneinfo tree
+    # whose path suffix IS the IANA name (".../zoneinfo/America/Chicago").
+    try:
+        real = os.path.realpath("/etc/localtime")
+        marker = "zoneinfo"
+        if marker in real:
+            candidate = real.split(marker, 1)[1].lstrip("/")
+            # Strip any versioned subdir prefix artifacts; validate via ZoneInfo.
+            from zoneinfo import ZoneInfo
+
+            ZoneInfo(candidate)
+            return candidate
+    except Exception:
+        pass
     return "UTC"
 
 
