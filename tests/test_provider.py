@@ -559,6 +559,24 @@ class FirePathTests(unittest.TestCase):
             self.assertFalse(result["fired"])
             self.assertEqual(h.store.fired, [])
 
+    def test_superseded_interval_timer_does_not_claim_or_rearm(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp, ProviderHarness(Path(tmp)) as h:
+            h.store.jobs = [interval_job("jobA", "2099-01-01T00:05:00+00:00")]
+            h.launch()
+            result = h.plugin._fire_workflow_impl(
+                "2099-01-01T00:00:00+00:00",
+                {"profile": h.provider._profile, "job_id": "jobA"},
+            )
+            self.assertEqual(
+                result,
+                {"fired": False, "reason": "superseded interval timer"},
+            )
+            self.assertEqual(h.store.claims, [])
+            self.assertEqual(h.store.fired, [])
+            self.assertEqual(h.dbos_state.started_workflows, [])
+
     def test_profile_fencing_refuses_foreign_fires(self):
         import tempfile
 

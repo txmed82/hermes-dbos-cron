@@ -135,6 +135,25 @@ def _fire_workflow_impl(scheduled_at: Any, context: Dict[str, Any]) -> Dict[str,
     if expected_profile and expected_profile != provider._profile:
         # A schedule from another profile's gateway must never fire here.
         return {"fired": False, "reason": "profile mismatch"}
+
+    # Interval/once timers are named for the exact next_run_at they were armed
+    # from. An older recovered timer may wake after a newer successful run has
+    # already advanced jobs.json. Without this fence, that stale timer claims
+    # the job, advances it again, and re-arms another timer, producing a
+    # self-sustaining catch-up storm. Cron schedules pass a datetime here and
+    # do not use this equality gate.
+    if isinstance(scheduled_at, str):
+        try:
+            from cron.jobs import get_job
+
+            live_job = get_job(job_id)
+        except Exception as exc:
+            logger.warning("DBOS fire: live-job lookup failed for %s: %s", job_id, exc)
+            return {"fired": False, "reason": f"job lookup failed: {type(exc).__name__}"}
+        live_schedule = (live_job or {}).get("schedule") or {}
+        if str(live_schedule.get("kind") or "") in {"interval", "once"}:
+            if str((live_job or {}).get("next_run_at") or "") != scheduled_at:
+                return {"fired": False, "reason": "superseded interval timer"}
     try:
         claimed = provider.claim_fire(job_id)
     except Exception as exc:  # job vanished, store locked, etc.
